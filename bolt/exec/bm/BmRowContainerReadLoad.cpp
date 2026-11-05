@@ -109,7 +109,11 @@ void BmRowContainer::ensureChunksLoaded(
   }
 
   const bool reserved = bytes == 0 || allocationPool_->maybeReserve(bytes);
-  BOLT_CHECK(reserved, "Cannot load {} bytes into BM RowContainer", bytes);
+  BOLT_CHECK(
+      reserved,
+      "Cannot load {} bytes into BM RowContainer (chunks={})",
+      bytes,
+      chunks.size());
 
   try {
     blockLoader_.loadChunks(chunks);

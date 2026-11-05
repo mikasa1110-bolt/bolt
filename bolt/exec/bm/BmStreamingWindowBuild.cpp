@@ -31,6 +31,7 @@ namespace bytedance::bolt::exec::window {
 namespace {
 
 constexpr vector_size_t kMinRowsPerFrontPop = 4096;
+constexpr uint64_t kChunkHeapTargetBytes = 128ULL << 20;
 
 std::vector<bool> makeNullableColumns(size_t size) {
   return std::vector<bool>(size, true);
@@ -96,7 +97,8 @@ void BmStreamingWindowBuild::initializeData() {
       memory::bm::MemoryTag::kWindow,
       memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge),
       memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge),
-      allocationPool_);
+      allocationPool_,
+      kChunkHeapTargetBytes);
 }
 
 bool BmStreamingWindowBuild::needsInput() {
@@ -492,6 +494,11 @@ std::optional<common::SpillStats> BmStreamingWindowBuild::windowSpilledStats()
 void BmStreamingWindowBuild::noMoreInput() {
   inputFinished_ = true;
   closeOpenPartition();
+  if (bmData_ && bmData_->heapTargetSealedChunks() > 0) {
+    LOG(INFO) << "BM heap chunk sealing summary: pool=" << pool_->name()
+              << ", targetBytes=" << kChunkHeapTargetBytes
+              << ", sealedChunks=" << bmData_->heapTargetSealedChunks();
+  }
 }
 
 bool BmStreamingWindowBuild::hasNextPartition() {

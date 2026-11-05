@@ -117,6 +117,9 @@ class BmSegmentCollection {
       vector_size_t count,
       std::vector<char*>* rows);
   void sealChunkAtBatchBoundary(SegmentData& segment);
+  uint64_t heapTargetSealedChunks() const {
+    return heapTargetSealedChunks_;
+  }
   void recordHeapForChunk(
       ChunkData& chunk,
       const BlockRef& heap,
@@ -192,6 +195,7 @@ class BmSegmentCollection {
   uint32_t rowStride_{0};
   uint32_t rowsPerChunk_{0};
   uint64_t chunkHeapTargetBytes_{0};
+  uint64_t heapTargetSealedChunks_{0};
   SegmentId nextSegmentId_{1};
   BlockId nextBlockId_{1};
   uint64_t nextGlobalRow_{0};

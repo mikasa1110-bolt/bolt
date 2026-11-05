@@ -56,6 +56,10 @@ class BmRowContainer {
       std::shared_ptr<memory::MemoryPool> allocationPool = nullptr,
       uint64_t chunkHeapTargetBytes = 0);
 
+  uint64_t heapTargetSealedChunks() const {
+    return segments_.heapTargetSealedChunks();
+  }
+
   // Allocates one row in the active segment for partition. The caller must fill
   // columns with store() before treating the row as complete.
   // TODO: Make row publication transactional before exposing append failures.

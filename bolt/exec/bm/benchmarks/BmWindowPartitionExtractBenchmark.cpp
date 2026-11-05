@@ -61,6 +61,22 @@ DEFINE_bool(
     false,
     "Evict unpinned BM blocks before every measured extraction so the timed "
     "path includes spill reads.");
+DEFINE_uint64(
+    bolt_benchmark_bm_window_extract_heap_target,
+    0,
+    "Chunk heap target in bytes.");
+DEFINE_bool(
+    bolt_benchmark_bm_window_extract_scan,
+    false,
+    "Extract the whole partition sequentially.");
+DEFINE_string(
+    bolt_benchmark_bm_window_extract_payload,
+    "",
+    "Run only this payload kind.");
+DEFINE_uint32(
+    bolt_benchmark_bm_window_extract_columns,
+    0,
+    "Run only this column count.");
 
 namespace bytedance::bolt::exec::bm::benchmarks {
 namespace {
@@ -226,7 +242,15 @@ class ExtractCase {
     std::iota(columns_.begin(), columns_.end(), 0);
     std::vector<bool> nullable(numColumns_, true);
     container_ = std::make_unique<BmRowContainer>(
-        types_, nullable, 0, context_.bufferManager, MemoryTag::kWindow);
+        types_,
+        nullable,
+        0,
+        context_.bufferManager,
+        MemoryTag::kWindow,
+        memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge),
+        memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge),
+        nullptr,
+        FLAGS_bolt_benchmark_bm_window_extract_heap_target);
 
     test::VectorMaker maker(context_.pool.get());
     for (vector_size_t start = 0; start < numRows_;
@@ -269,6 +293,25 @@ class ExtractCase {
     }
 
     segment_ = container_->spillActiveSegment();
+    {
+      auto session =
+          container_->beginReadOnlyWindowReadSegments({&segment_, 1});
+      const auto rowIds = session.listRowIds();
+      size_t chunks = 0;
+      BlockId previous = kNoBlock;
+      for (const auto& rowId : rowIds) {
+        if (rowId.rowBlockId != previous) {
+          ++chunks;
+          previous = rowId.rowBlockId;
+        }
+      }
+      fmt::print(
+          stderr,
+          "heap_target={} rows={} chunks={}\n",
+          FLAGS_bolt_benchmark_bm_window_extract_heap_target,
+          rowIds.size(),
+          chunks);
+    }
     context_.bufferManager->Reclaim(context_.bufferManager->reclaimableBytes());
     context_.bufferManager->ReleaseUnusedReservation();
     context_.pool->release();
@@ -289,7 +332,9 @@ class ExtractCase {
     // Leave too little root-pool headroom for a whole-partition BulkRead so
     // the first extraction selects WindowRead. Release the setup pressure
     // before measuring either extraction path.
-    constexpr uint64_t kWindowReadSlack = 32ULL << 20;
+    const uint64_t kWindowReadSlack = std::max<uint64_t>(
+        32ULL << 20,
+        FLAGS_bolt_benchmark_bm_window_extract_logical_bytes * 3 / 2);
     const auto freeBeforePressure = context_.rootPool->freeBytes();
     BOLT_CHECK_GT(freeBeforePressure, kWindowReadSlack);
     const auto pressureBytes = freeBeforePressure - kWindowReadSlack;
@@ -310,28 +355,38 @@ class ExtractCase {
 
   Sample run(bool batchColumns, bool verify) {
     if (FLAGS_bolt_benchmark_bm_window_extract_force_reclaim) {
+      partition_->reclaimReadChunks();
       context_.bufferManager->Reclaim(
           context_.bufferManager->reclaimableBytes());
     }
 
     std::vector<VectorPtr> results;
     results.reserve(numColumns_);
-    for (const auto& type : types_) {
-      results.push_back(BaseVector::create(type, 0, context_.pool.get()));
-    }
 
 #ifndef NDEBUG
     window::resetBmWindowPartitionTestStats();
 #endif
     const auto before = context_.bufferManager->stats();
     const auto start = std::chrono::steady_clock::now();
-    if (batchColumns) {
-      partition_->extractInputColumns(
-          partitionOffset_, outputRows_, 0, {results.data(), results.size()});
-    } else {
-      for (column_index_t column = 0; column < numColumns_; ++column) {
-        partition_->extractColumn(
-            column, partitionOffset_, outputRows_, 0, results[column]);
+    const auto end = FLAGS_bolt_benchmark_bm_window_extract_scan
+        ? numRows_
+        : partitionOffset_ + outputRows_;
+    for (auto offset =
+             FLAGS_bolt_benchmark_bm_window_extract_scan ? 0 : partitionOffset_;
+         offset < end;
+         offset += outputRows_) {
+      const auto count = std::min(outputRows_, end - offset);
+      results.clear();
+      for (const auto& type : types_) {
+        results.push_back(BaseVector::create(type, 0, context_.pool.get()));
+      }
+      if (batchColumns) {
+        partition_->extractInputColumns(
+            offset, count, 0, {results.data(), results.size()});
+      } else {
+        for (column_index_t column = 0; column < numColumns_; ++column) {
+          partition_->extractColumn(column, offset, count, 0, results[column]);
+        }
       }
     }
     const auto elapsedUs =
@@ -344,7 +399,10 @@ class ExtractCase {
 #endif
 
     if (verify) {
-      verifyResults(results);
+      const auto lastOffset = FLAGS_bolt_benchmark_bm_window_extract_scan
+          ? ((numRows_ - 1) / outputRows_) * outputRows_
+          : partitionOffset_;
+      verifyResults(results, lastOffset, end - lastOffset);
 #ifndef NDEBUG
       BOLT_CHECK_GT(stats.loadRowsCalls, 0);
 #endif
@@ -373,14 +431,16 @@ class ExtractCase {
   }
 
  private:
-  void verifyResults(const std::vector<VectorPtr>& results) const {
+  void verifyResults(
+      const std::vector<VectorPtr>& results,
+      vector_size_t offset,
+      vector_size_t count) const {
     BOLT_CHECK_EQ(results.size(), numColumns_);
-    const std::array<vector_size_t, 3> sampleRows{
-        0, outputRows_ / 2, outputRows_ - 1};
+    const std::array<vector_size_t, 3> sampleRows{0, count / 2, count - 1};
     for (const auto outputRow : sampleRows) {
-      const auto sourceRow = partitionOffset_ + outputRow;
+      const auto sourceRow = offset + outputRow;
       for (column_index_t column = 0; column < numColumns_; ++column) {
-        BOLT_CHECK_EQ(results[column]->size(), outputRows_);
+        BOLT_CHECK_EQ(results[column]->size(), count);
         BOLT_CHECK(!results[column]->isNullAt(outputRow));
         switch (columnKind(payload_, column)) {
           case ColumnKind::kFixed:
@@ -517,6 +577,13 @@ int main(int argc, char** argv) {
         bytedance::bolt::exec::bm::benchmarks::PayloadKind::kMixed,
         bytedance::bolt::exec::bm::benchmarks::PayloadKind::kArray}) {
     for (const auto columns : {2, 4, 8, 16, 32}) {
+      if ((!FLAGS_bolt_benchmark_bm_window_extract_payload.empty() &&
+           FLAGS_bolt_benchmark_bm_window_extract_payload !=
+               bytedance::bolt::exec::bm::benchmarks::payloadName(payload)) ||
+          (FLAGS_bolt_benchmark_bm_window_extract_columns &&
+           FLAGS_bolt_benchmark_bm_window_extract_columns != columns)) {
+        continue;
+      }
       bytedance::bolt::exec::bm::benchmarks::runCase(payload, columns);
     }
   }

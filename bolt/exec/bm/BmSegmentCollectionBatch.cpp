@@ -118,6 +118,7 @@ void BmSegmentCollection::sealChunkAtBatchBoundary(SegmentData& segment) {
   auto& cursor = segment.writeCursor;
   if (cursor.chunk != nullptr && cursor.chunk->sealRequested &&
       cursor.nextRow != cursor.rowBlockEnd) {
+    ++heapTargetSealedChunks_;
     // Retain the current chunk pointer and defer successor allocation until the
     // next prefix. This boundary is reached only after every column writer has
     // published its heap cursor.
