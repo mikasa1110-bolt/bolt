@@ -611,12 +611,14 @@ TEST_F(
     const auto chunkRows = chunkRowCounts(rowIds);
     if (chunkHeapTargetBytes != 0) {
       EXPECT_GT(chunkRows.size(), 1);
+      EXPECT_GT(container.heapTargetSealedChunks(), 0);
       // The target is soft: the final complete piece can cross it.
       EXPECT_LE(
           (allocatedBlocks - chunkRows.size()) * kHeapBlockSize,
           chunkRows.size() * (chunkHeapTargetBytes + 2 * kHeapBlockSize));
     } else {
       EXPECT_EQ(std::vector<size_t>({kRows}), chunkRows);
+      EXPECT_EQ(container.heapTargetSealedChunks(), 0);
     }
 
     // Load once, release all pins, reclaim the resident blocks, then require

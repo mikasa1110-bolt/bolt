@@ -2386,6 +2386,179 @@ TEST_F(BmStreamingWindowBuildTest, doesNotSpillDuringStoreWithoutReclaim) {
   EXPECT_FALSE(build.windowSpilledStats().has_value());
 }
 
+TEST_F(BmStreamingWindowBuildDiskIoTest, defaultHeapTargetSealsWindowChunks) {
+  constexpr vector_size_t kRows = 513;
+  auto data = makeRowVector(
+      {"id", "payload", "pre", "fol"},
+      {makeFlatVector<int64_t>(kRows, [](auto row) { return row; }),
+       makeFlatVector<std::string>(
+           kRows,
+           [](auto row) { return std::string(1 << 20, 'a' + row % 26); }),
+       makeFlatVector<int64_t>(kRows, [](auto row) { return row - 2; }),
+       makeFlatVector<int64_t>(kRows, [](auto row) { return row + 2; })});
+  const std::vector<std::string> functions{
+      "sum(id) over (order by id rows between 2 preceding and 2 following)",
+      "sum(id) over (order by id range between pre preceding and fol following)",
+      "lead(id) over (order by id)",
+      "lag(id) over (order by id)"};
+  // Reproduce the old layout with the same data and the existing disabled
+  // target. All row slots fit in one row block, so heap growth alone used to
+  // produce a single chunk containing the whole partition.
+  {
+    auto manager =
+        createWindowTestBufferManager(pool()->root(), "large-window-control");
+    bm::BmRowContainer unbounded(
+        asRowType(data->type())->children(),
+        {true, true, true, true},
+        1,
+        manager,
+        memory::bm::MemoryTag::kWindow);
+    for (vector_size_t offset = 0; offset < kRows; offset += 128) {
+      unbounded.appendBatch(std::dynamic_pointer_cast<RowVector>(
+          data->slice(offset, std::min<vector_size_t>(128, kRows - offset))));
+    }
+    const auto segment = unbounded.activeSegmentId();
+    auto session = unbounded.beginReadOnlyWindowReadSegments({&segment, 1});
+    const auto rowIds = session.listRowIds();
+    ASSERT_EQ(kRows, rowIds.size());
+    std::set<bm::BlockId> rowBlocks;
+    for (const auto& row : rowIds) {
+      rowBlocks.insert(row.rowBlockId);
+    }
+    ASSERT_EQ(1, rowBlocks.size());
+    const auto stats = manager->stats();
+    ASSERT_EQ(130, stats.allocatedBlocks);
+    ASSERT_EQ(
+        520ULL << 20, stats.pinnedResidentBytes + stats.unpinnedResidentBytes);
+    RecordProperty("unbounded_chunk_bytes", std::to_string(520ULL << 20));
+  }
+
+  auto expected = expectedSortWindowResults(pool(), data, functions);
+  auto node = std::dynamic_pointer_cast<const core::WindowNode>(
+      PlanBuilder(pool()).values({data}).streamingWindow(functions).planNode());
+
+  for (const bool reclaim : {false, true}) {
+    SCOPED_TRACE(reclaim);
+    auto directory = TempDirectoryPath::create();
+    auto task = makeDirectWindowTask(node, directory->path);
+    auto config = task->queryCtx()->queryConfig().rawConfigsCopy();
+    config[core::QueryConfig::kPreferredOutputBatchRows] = "17";
+    config[core::QueryConfig::kMaxOutputBatchRows] = "17";
+    task->queryCtx()->testingOverrideConfigUnsafe(std::move(config));
+    auto driver =
+        Driver::testingCreate(std::make_unique<DriverCtx>(task, 0, 0, 0, 0));
+    TestWindowInjection injection(WindowBuildType::kBmStreamingWindowBuild);
+    Window window(0, driver->driverCtx(), node);
+    window.initialize();
+    const auto blocksBefore = task->bufferManager()->stats().allocatedBlocks;
+    for (vector_size_t offset = 0; offset < 512; offset += 128) {
+      window.addInput(
+          std::dynamic_pointer_cast<RowVector>(data->slice(offset, 128)));
+    }
+    window.addInput(std::dynamic_pointer_cast<RowVector>(data->slice(512, 1)));
+    // A complete piece may cross the soft target. An unbounded chunk uses
+    // 130 blocks; additional row blocks demonstrate early chunk boundaries.
+    ASSERT_GT(
+        task->bufferManager()->stats().allocatedBlocks - blocksBefore, 130);
+    ASSERT_LT(
+        task->bufferManager()->stats().allocatedBlocks - blocksBefore, 150);
+    const auto stored = task->bufferManager()->stats();
+    ASSERT_LT(
+        stored.pinnedResidentBytes + stored.unpinnedResidentBytes,
+        600ULL << 20);
+    EXPECT_EQ(0, stored.spillWriteCount);
+    RecordProperty(
+        "bounded_total_resident_bytes",
+        std::to_string(
+            stored.pinnedResidentBytes + stored.unpinnedResidentBytes));
+
+    if (reclaim) {
+      memory::MemoryReclaimer::Stats stats;
+      window.reclaim(1, stats);
+      ASSERT_GT(task->bufferManager()->stats().spillWriteCount, 0);
+    }
+    window.noMoreInput();
+    vector_size_t offset = 0;
+    while (!window.isFinished()) {
+      Operator::NonReclaimableSectionGuard guard(&window);
+      auto output = window.getOutput();
+      ASSERT_NE(nullptr, output);
+      ASSERT_LE(offset + output->size(), expected->size());
+      for (vector_size_t row = 0; row < output->size(); ++row) {
+        ASSERT_TRUE(output->equalValueAt(expected.get(), row, offset + row))
+            << "row=" << offset + row;
+      }
+      offset += output->size();
+    }
+    EXPECT_EQ(kRows, offset);
+    if (reclaim) {
+      EXPECT_GT(task->bufferManager()->stats().spillReadCount, 0);
+    }
+  }
+}
+
+TEST_F(
+    BmStreamingWindowBuildDiskIoTest,
+    nestedConstantPayloadKeepsChunksSmall) {
+  constexpr vector_size_t kRows = 512;
+  auto value = makeFlatVector<std::string>({std::string(1 << 20, 'x')});
+  std::vector<vector_size_t> offsets(kRows);
+  for (vector_size_t row = 0; row < kRows; ++row) {
+    offsets[row] = row;
+  }
+  auto arrays =
+      makeArrayVector(offsets, BaseVector::wrapInConstant(kRows, 0, value));
+  auto data = makeRowVector(
+      {"id", "payload"},
+      {makeFlatVector<int64_t>(kRows, [](auto row) { return row; }), arrays});
+  const std::vector<std::string> functions{
+      "sum(id) over (order by id rows between 2 preceding and 2 following)",
+      "lead(id) over (order by id)",
+      "lag(id) over (order by id)"};
+  auto expected = expectedSortWindowResults(pool(), data, functions);
+  auto node = std::dynamic_pointer_cast<const core::WindowNode>(
+      PlanBuilder(pool()).values({data}).streamingWindow(functions).planNode());
+  auto directory = TempDirectoryPath::create();
+  auto task = makeDirectWindowTask(node, directory->path);
+  auto driver =
+      Driver::testingCreate(std::make_unique<DriverCtx>(task, 0, 0, 0, 0));
+  TestWindowInjection injection(WindowBuildType::kBmStreamingWindowBuild);
+  Window window(0, driver->driverCtx(), node);
+  window.initialize();
+  window.addInput(data);
+  const auto stored = task->bufferManager()->stats();
+  // A serialized one-string array is 1 MiB + 16 bytes; three fit per heap
+  // block. Each complete piece may cross the soft heap target.
+  constexpr uint64_t kHeapBlocks = (kRows + 2) / 3;
+  const auto rowBlocks = stored.allocatedBlocks - kHeapBlocks;
+  EXPECT_GE(rowBlocks, 5);
+  EXPECT_LE(rowBlocks, 8);
+  RecordProperty("row_blocks", std::to_string(rowBlocks));
+  RecordProperty("input_used_bytes", std::to_string(data->usedSize()));
+  RecordProperty(
+      "resident_bytes",
+      std::to_string(
+          stored.pinnedResidentBytes + stored.unpinnedResidentBytes));
+  memory::MemoryReclaimer::Stats reclaimStats;
+  window.reclaim(1, reclaimStats);
+  EXPECT_GT(task->bufferManager()->stats().spillWriteCount, 0);
+  window.noMoreInput();
+  vector_size_t offset = 0;
+  while (!window.isFinished()) {
+    Operator::NonReclaimableSectionGuard guard(&window);
+    auto output = window.getOutput();
+    ASSERT_NE(nullptr, output);
+    ASSERT_LE(offset + output->size(), expected->size());
+    for (vector_size_t row = 0; row < output->size(); ++row) {
+      ASSERT_TRUE(output->equalValueAt(expected.get(), row, offset + row))
+          << "row=" << offset + row;
+    }
+    offset += output->size();
+  }
+  EXPECT_EQ(kRows, offset);
+  EXPECT_GT(task->bufferManager()->stats().spillReadCount, 0);
+}
+
 TEST_F(BmStreamingWindowBuildDiskIoTest, windowReclaimSpillsDuringStore) {
   constexpr vector_size_t size = 4'096;
   constexpr vector_size_t inputRowsPerBatch = 512;
