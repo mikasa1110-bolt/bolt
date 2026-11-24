@@ -582,6 +582,10 @@ class DecimalUtil {
       uint8_t aRescale,
       uint8_t /*bRescale*/) {
     BOLT_USER_CHECK_NE(b, 0, "Division by zero");
+    if (a == 0) {
+      r = 0;
+      return 0;
+    }
     int resultSign = 1;
     R unsignedDividendRescaled(a);
     if (a < 0) {
@@ -594,48 +598,61 @@ class DecimalUtil {
       unsignedDivisor *= -1;
     }
 
-    if (aRescale <= LongDecimalType::kMaxPrecision &&
-        (DecimalUtil::kPowersOfTen[aRescale] * unsignedDividendRescaled /
-             unsignedDividendRescaled ==
-         DecimalUtil::kPowersOfTen[aRescale])) {
-      unsignedDividendRescaled = checkedMultiply<R>(
-          unsignedDividendRescaled,
-          R(DecimalUtil::kPowersOfTen[aRescale]),
-          "Decimal");
-      R quotient = unsignedDividendRescaled / unsignedDivisor;
-      R remainder = unsignedDividendRescaled % unsignedDivisor;
+    constexpr uint8_t kMaxFastRescale = std::is_same_v<R, int64_t>
+        ? ShortDecimalType::kMaxPrecision
+        : LongDecimalType::kMaxPrecision;
+    R rescaledDividend = 0;
+    if (aRescale <= kMaxFastRescale &&
+        !__builtin_mul_overflow(
+            unsignedDividendRescaled,
+            static_cast<R>(DecimalUtil::kPowersOfTen[aRescale]),
+            &rescaledDividend)) {
+      R quotient = rescaledDividend / unsignedDivisor;
+      R remainder = rescaledDividend % unsignedDivisor;
       if (!noRoundUp &&
-          static_cast<const B>(remainder) * 2 >= unsignedDivisor) {
+          static_cast<const B>(remainder) >=
+              unsignedDivisor - static_cast<const B>(remainder)) {
         ++quotient;
       }
       r = quotient * resultSign;
       return remainder * resultSign;
     } else {
-      // use int256_t for divide
+      // Use int256_t with non-negative magnitudes; apply resultSign at the end.
       int256_t aLarge = a;
-      for (int i = 0; i < aRescale / LongDecimalType::kMaxPrecision; i++) {
-        aLarge *=
-            bolt::DecimalUtil::getPowersOfTen(LongDecimalType::kMaxPrecision);
+      if (aLarge < 0) {
+        aLarge = -aLarge;
       }
-      aLarge *= bolt::DecimalUtil::getPowersOfTen(
-          aRescale % LongDecimalType::kMaxPrecision);
+      auto mulChecked = [&](const int256_t& factor) {
+        if (UNLIKELY(aLarge > std::numeric_limits<int256_t>::max() / factor)) {
+          BOLT_ARITHMETIC_ERROR("Decimal overflow: {} / {}", a, b);
+        }
+        aLarge *= factor;
+      };
+      for (int i = 0; i < aRescale / LongDecimalType::kMaxPrecision; i++) {
+        mulChecked(DecimalUtil::getPowersOfTen(LongDecimalType::kMaxPrecision));
+      }
+      if (const uint8_t remScale = aRescale % LongDecimalType::kMaxPrecision;
+          remScale > 0) {
+        mulChecked(DecimalUtil::getPowersOfTen(remScale));
+      }
 
       int256_t bLarge = b;
+      if (bLarge < 0) {
+        bLarge = -bLarge;
+      }
       int256_t resultLarge = aLarge / bLarge;
       int256_t remainderLarge = aLarge % bLarge;
       if (!noRoundUp && remainderLarge * 2 >= bLarge) {
         ++resultLarge;
       }
-      auto checkOverflow = [](int256_t value) {
-        BOLT_CHECK(
-            value <= std::numeric_limits<R>::max() &&
-            value >= std::numeric_limits<R>::min());
-      };
 
       int256_t result = resultLarge * resultSign;
       int256_t remainder = remainderLarge * resultSign;
-      checkOverflow(result);
-      checkOverflow(remainder);
+      if (UNLIKELY(
+              result > std::numeric_limits<R>::max() ||
+              result < std::numeric_limits<R>::min())) {
+        BOLT_ARITHMETIC_ERROR("Decimal overflow: {} / {}", a, b);
+      }
       r = result.convert_to<R>();
       return remainder.convert_to<R>();
     }

@@ -365,15 +365,37 @@ TEST_F(DecimalArithmeticTest, decimalDivTest) {
 
   auto mul = [](int128_t a) { return a * 10000000000; };
 
-  // Divide and round-up may overflow.
+  // Divide and round-up may overflow intermediate int128_t rescaling (including
+  // negative operands in the fallback path).
   testDecimalExpr<TypeKind::HUGEINT>(
       {makeFlatVector<int128_t>(
-          {mul(1401718506) + 8894464614, mul(1375723974) + 7417078237},
+          {mul(1401718506) + 8894464614,
+           mul(1375723974) + 7417078237,
+           -(mul(1401718506) + 8894464614),
+           -(mul(1401718506) + 8894464614),
+           mul(1401718506) + 8894464614},
           DECIMAL(38, 20))},
       "divide(c0, c1)",
-      {makeFlatVector<int128_t>({1, 1}, DECIMAL(28, 0)),
+      {makeFlatVector<int128_t>({1, 1, -1, 1, -1}, DECIMAL(28, 0)),
        makeFlatVector<int128_t>(
-           {mul(71341000000), mul(72689000000)}, DECIMAL(28, 20))});
+           {mul(71341000000),
+            mul(72689000000),
+            mul(71341000000),
+            -mul(71341000000),
+            -mul(71341000000)},
+           DECIMAL(28, 20))});
+
+  // Zero dividend and intermediate rescaling overflow with valid final
+  // quotient.
+  testDecimalExpr<TypeKind::HUGEINT>(
+      {makeFlatVector<int128_t>(
+          {0, DecimalUtil::kLongDecimalMax, -DecimalUtil::kLongDecimalMax},
+          DECIMAL(38, 2))},
+      "c0 / c1",
+      {makeFlatVector<int128_t>(
+           {0, DecimalUtil::kLongDecimalMax, -DecimalUtil::kLongDecimalMax},
+           DECIMAL(38, 0)),
+       makeFlatVector<int64_t>({10000, 10000, 10000}, DECIMAL(5, 2))});
 
   // Divide by zero.
   BOLT_ASSERT_THROW(
@@ -388,7 +410,15 @@ TEST_F(DecimalArithmeticTest, decimalDivTest) {
           {makeFlatVector(
               std::vector<int128_t>{DecimalUtil::kLongDecimalMax},
               DECIMAL(38, 0))}),
-      "Decimal overflow: 99999999999999999999999999999999999999 * 10000");
+      "Decimal overflow: 99999999999999999999999999999999999999 / 1");
+  BOLT_ASSERT_THROW(
+      testDecimalExpr<TypeKind::HUGEINT>(
+          {},
+          "c0 / 0.01",
+          {makeFlatVector(
+              std::vector<int128_t>{-DecimalUtil::kLongDecimalMax},
+              DECIMAL(38, 0))}),
+      "Decimal overflow: -99999999999999999999999999999999999999 / 1");
 }
 
 TEST_F(DecimalArithmeticTest, decimalDivDifferentTypes) {

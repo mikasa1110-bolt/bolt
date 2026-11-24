@@ -574,6 +574,92 @@ TEST(DecimalTest, divideWithRoundUp) {
   DecimalUtil::divideWithRoundUp<int128_t, int64_t, int128_t>(
       r, 1, 72689000000, false, 20, 10);
   EXPECT_EQ(r, 1375723975);
+
+  // Zero dividend across fast and fallback rescale paths.
+  for (uint8_t aRescale : {uint8_t{0}, uint8_t{4}, uint8_t{40}}) {
+    for (int128_t b : {int128_t{1}, int128_t{-1}, int128_t{7}}) {
+      for (bool noRoundUp : {false, true}) {
+        r = 123;
+        EXPECT_EQ(
+            (DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+                r, 0, b, noRoundUp, aRescale, 0)),
+            0);
+        EXPECT_EQ(r, 0);
+      }
+    }
+  }
+  BOLT_ASSERT_THROW(
+      (DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+          r, 0, 0, false, 0, 0)),
+      "Division by zero");
+
+  // Negative operands in fallback path (aRescale > 38) must preserve sign
+  // and round half-up away from zero.
+  const int128_t divisor40 =
+      static_cast<int128_t>(71341000000LL) * DecimalUtil::kPowersOfTen[10];
+  const int128_t expectedAbs =
+      static_cast<int128_t>(1401718506LL) * DecimalUtil::kPowersOfTen[10] +
+      8894464614LL;
+  DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+      r, -1, divisor40, false, 40, 0);
+  EXPECT_EQ(r, -expectedAbs);
+  DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+      r, 1, -divisor40, false, 40, 0);
+  EXPECT_EQ(r, -expectedAbs);
+  DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+      r, -1, -divisor40, false, 40, 0);
+  EXPECT_EQ(r, expectedAbs);
+  DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+      r, -1, divisor40, true, 40, 0);
+  EXPECT_EQ(r, -(expectedAbs - 1));
+
+  // Intermediate int128_t rescaling overflow (aRescale <= 38) with exact
+  // half-up rounding and sign preservation.
+  const int128_t halfNumerator = DecimalUtil::kPowersOfTen[37] + 5;
+  const int128_t expectedHalf = 5 * DecimalUtil::kPowersOfTen[36] + 2;
+  DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+      r, -halfNumerator, 20000, false, 4, 0);
+  EXPECT_EQ(r, -(expectedHalf + 1));
+  DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+      r, -halfNumerator, 20000, true, 4, 0);
+  EXPECT_EQ(r, -expectedHalf);
+  DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+      r, -halfNumerator, -20000, false, 4, 0);
+  EXPECT_EQ(r, expectedHalf + 1);
+  DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+      r, DecimalUtil::kLongDecimalMax, 10000, false, 4, 0);
+  EXPECT_EQ(r, DecimalUtil::kLongDecimalMax);
+  DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+      r, -DecimalUtil::kLongDecimalMax, 10000, false, 4, 0);
+  EXPECT_EQ(r, -DecimalUtil::kLongDecimalMax);
+
+  // Overflow throws BoltUserError with "Decimal overflow" message, including
+  // when aRescale = 76 exceeds int256_t.
+  BOLT_ASSERT_THROW(
+      (DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+          r, DecimalUtil::kLongDecimalMax, 1, false, 4, 0)),
+      "Decimal overflow: 99999999999999999999999999999999999999 / 1");
+  BOLT_ASSERT_THROW(
+      (DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+          r, -DecimalUtil::kLongDecimalMax, 1, false, 4, 0)),
+      "Decimal overflow: -99999999999999999999999999999999999999 / 1");
+  BOLT_ASSERT_THROW(
+      (DecimalUtil::divideWithRoundUp<int128_t, int128_t, int128_t>(
+          r,
+          DecimalUtil::kLongDecimalMax,
+          DecimalUtil::kPowersOfTen[38],
+          false,
+          76,
+          0)),
+      "Decimal overflow");
+
+  // Unsigned __uint128_t instantiation used by computeAverage().
+  __uint128_t unsignedQ = 0;
+  const __uint128_t unsignedRem =
+      DecimalUtil::divideWithRoundUp<__uint128_t, __uint128_t, int64_t>(
+          unsignedQ, DecimalUtil::kOverflowMultiplier, 3, true, 0, 0);
+  EXPECT_EQ(unsignedQ, DecimalUtil::kOverflowMultiplier / 3);
+  EXPECT_EQ(unsignedRem, DecimalUtil::kOverflowMultiplier % 3);
 }
 
 } // namespace
